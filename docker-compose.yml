@@ -1,3 +1,5 @@
+version: "3"
+
 services:
   boulder:
     # The `letsencrypt/boulder-tools:latest` tag is automatically built in local
@@ -8,7 +10,7 @@ services:
       context: test/boulder-tools/
       # Should match one of the GO_CI_VERSIONS in test/boulder-tools/tag_and_upload.sh.
       args:
-        GO_VERSION: 1.25.0
+        GO_VERSION: 1.24.1
     environment:
       # To solve HTTP-01 and TLS-ALPN-01 challenges, change the IP in FAKE_DNS
       # to the IP address where your ACME client's solver is listening. This is
@@ -16,6 +18,7 @@ services:
       FAKE_DNS: 64.112.117.122
       BOULDER_CONFIG_DIR: test/config
       GOCACHE: /boulder/.gocache/go-build
+      GOFLAGS: -mod=vendor
     volumes:
       - .:/boulder:cached
       - ./.gocache:/root/.cache/go-build:cached
@@ -48,12 +51,15 @@ services:
       - "integration.trust:64.112.117.122"
     ports:
       - 4001:4001 # ACMEv2
+      - 4002:4002 # OCSP
       - 4003:4003 # SFE
     depends_on:
       - bmysql
       - bproxysql
       - bredis_1
       - bredis_2
+      - bredis_3
+      - bredis_4
       - bconsul
       - bjaeger
       - bpkimetal
@@ -68,11 +74,6 @@ services:
       - ./test/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/:cached
     entrypoint: test/certs/generate.sh
     working_dir: *boulder_working_dir
-    profiles:
-      # Adding a profile to this container means that it won't be started by a
-      # normal "docker compose up/run boulder", only when specifically invoked
-      # with a "docker compose up bsetup".
-      - setup
 
   bmysql:
     image: mariadb:10.11.13
@@ -111,12 +112,34 @@ services:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
+    command: redis-server /test/redis-ocsp.config
+    networks:
+      bouldernet:
+        # TODO(#8215): Remove this static IP allocation (and similar below) when
+        # we tear down ocsp-responder. We only have it because ocsp-responder
+        # requires IPs in its "ShardAddrs" config, while ratelimit redis
+        # supports looking up shards via hostname and SRV record.
+        ipv4_address: 10.77.77.2
+
+  bredis_2:
+    image: redis:6.2.7
+    volumes:
+      - ./test/:/test/:cached
+    command: redis-server /test/redis-ocsp.config
+    networks:
+      bouldernet:
+        ipv4_address: 10.77.77.3
+
+  bredis_3:
+    image: redis:6.2.7
+    volumes:
+      - ./test/:/test/:cached
     command: redis-server /test/redis-ratelimits.config
     networks:
       bouldernet:
         ipv4_address: 10.77.77.4
 
-  bredis_2:
+  bredis_4:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
@@ -136,57 +159,14 @@ services:
 
   bjaeger:
     image: jaegertracing/all-in-one:1.50
-    networks:
-      - bouldernet
 
   bpkimetal:
     image: ghcr.io/pkimetal/pkimetal:v1.20.0
-    networks:
-      - bouldernet
 
 networks:
-  # This network represents the data-center internal network. It is used for
-  # boulder services and their infrastructure, such as consul, mariadb, and
-  # redis.
   bouldernet:
-    driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 10.77.77.0/24
-          # Only issue DHCP addresses in the top half of the range, to avoid
-          # conflict with static addresses.
-          ip_range: 10.77.77.128/25
-
-  # This network represents the public internet. It uses a real public IP space
-  # (that Let's Encrypt controls) so that our integration tests are happy to
-  # validate and issue for it. It is used by challtestsrv, which binds to
-  # 64.112.117.122:80 and :443 for its HTTP-01 challenge responder.
-  #
-  # TODO(#8215): Put akamai-test-srv and s3-test-srv on this network.
+    driver: overlay
   publicnet:
-    driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 64.112.117.0/25
-
-  # This network is used for two things in the integration tests:
-  #  - challtestsrv binds to 64.112.117.134:443 for its tls-alpn-01 challenge
-  #    responder, to avoid interfering with the HTTPS port used for testing
-  #    HTTP->HTTPS redirects during http-01 challenges. Note: this could
-  #    probably be updated in the future so that challtestsrv can handle
-  #    both tls-alpn-01 and HTTPS on the same port.
-  #  - test/v2_integration.py has some test cases that start their own HTTP
-  #    server instead of relying on challtestsrv, because they want very
-  #    specific behavior. For these cases, v2_integration.py creates a Python
-  #    HTTP server and binds it to 64.112.117.134:80.
-  #
-  # TODO(#8215): Deprecate this network, replacing it with individual IPs within
-  # the existing publicnet.
+    driver: overlay
   publicnet2:
-    driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 64.112.117.128/25
+    driver: overlay
